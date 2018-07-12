@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/lucas-clemente/quic-go/internal/protocol"
 	"github.com/lucas-clemente/quic-go/internal/utils"
@@ -11,35 +12,46 @@ import (
 )
 
 // parseHeader parses the header.
-func parseHeader(b *bytes.Reader, packetSentBy protocol.Perspective) (*Header, error) {
+func parseHeader(b *bytes.Reader) (*Header, error) {
 	typeByte, err := b.ReadByte()
 	if err != nil {
 		return nil, err
 	}
 	if typeByte&0x80 > 0 {
-		return parseLongHeader(b, packetSentBy, typeByte)
+		return parseLongHeader(b, typeByte)
 	}
 	return parseShortHeader(b, typeByte)
 }
 
 // parse long header and version negotiation packets
-func parseLongHeader(b *bytes.Reader, sentBy protocol.Perspective, typeByte byte) (*Header, error) {
-	connID, err := utils.BigEndian.ReadUint64(b)
-	if err != nil {
-		return nil, err
-	}
+func parseLongHeader(b *bytes.Reader, typeByte byte) (*Header, error) {
 	v, err := utils.BigEndian.ReadUint32(b)
 	if err != nil {
 		return nil, err
 	}
-	h := &Header{
-		ConnectionID: protocol.ConnectionID(connID),
-		Version:      protocol.VersionNumber(v),
+
+	connIDLenByte, err := b.ReadByte()
+	if err != nil {
+		return nil, err
 	}
+	dcil, scil := decodeConnIDLen(connIDLenByte)
+	destConnID, err := protocol.ReadConnectionID(b, dcil)
+	if err != nil {
+		return nil, err
+	}
+	srcConnID, err := protocol.ReadConnectionID(b, scil)
+	if err != nil {
+		return nil, err
+	}
+
+	h := &Header{
+		IsLongHeader:     true,
+		Version:          protocol.VersionNumber(v),
+		DestConnectionID: destConnID,
+		SrcConnectionID:  srcConnID,
+	}
+
 	if v == 0 { // version negotiation packet
-		if sentBy == protocol.PerspectiveClient {
-			return nil, qerr.InvalidVersion
-		}
 		if b.Len() == 0 {
 			return nil, qerr.Error(qerr.InvalidVersionNegotiationPacket, "empty version list")
 		}
@@ -54,57 +66,46 @@ func parseLongHeader(b *bytes.Reader, sentBy protocol.Perspective, typeByte byte
 		}
 		return h, nil
 	}
-	h.IsLongHeader = true
-	pn, err := utils.BigEndian.ReadUint32(b)
+
+	pl, err := utils.ReadVarInt(b)
 	if err != nil {
 		return nil, err
 	}
-	h.PacketNumber = protocol.PacketNumber(pn)
-	h.PacketNumberLen = protocol.PacketNumberLen4
-	h.Type = protocol.PacketType(typeByte & 0x7f)
-	if sentBy == protocol.PerspectiveClient && (h.Type != protocol.PacketTypeInitial && h.Type != protocol.PacketTypeHandshake && h.Type != protocol.PacketType0RTT) {
-		return nil, qerr.Error(qerr.InvalidPacketHeader, fmt.Sprintf("Received packet with invalid packet type: %d", h.Type))
+	h.PayloadLen = protocol.ByteCount(pl)
+	pn, pnLen, err := utils.ReadVarIntPacketNumber(b)
+	if err != nil {
+		return nil, err
 	}
-	if sentBy == protocol.PerspectiveServer && (h.Type != protocol.PacketTypeRetry && h.Type != protocol.PacketTypeHandshake) {
+	h.PacketNumber = pn
+	h.PacketNumberLen = pnLen
+	h.Type = protocol.PacketType(typeByte & 0x7f)
+
+	if h.Type != protocol.PacketTypeInitial && h.Type != protocol.PacketTypeRetry && h.Type != protocol.PacketType0RTT && h.Type != protocol.PacketTypeHandshake {
 		return nil, qerr.Error(qerr.InvalidPacketHeader, fmt.Sprintf("Received packet with invalid packet type: %d", h.Type))
 	}
 	return h, nil
 }
 
 func parseShortHeader(b *bytes.Reader, typeByte byte) (*Header, error) {
-	omitConnID := typeByte&0x40 > 0
-	var connID uint64
-	if !omitConnID {
-		var err error
-		connID, err = utils.BigEndian.ReadUint64(b)
-		if err != nil {
-			return nil, err
+	connID := make(protocol.ConnectionID, 8)
+	if _, err := io.ReadFull(b, connID); err != nil {
+		if err == io.ErrUnexpectedEOF {
+			err = io.EOF
 		}
+		return nil, err
 	}
-	// bit 4 must be set, bit 5 must be unset
-	if typeByte&0x18 != 0x10 {
-		return nil, errors.New("invalid bit 4 and 5")
+	// bits 2 and 3 must be set, bit 4 must be unset
+	if typeByte&0x38 != 0x30 {
+		return nil, errors.New("invalid bits 3, 4 and 5")
 	}
-	var pnLen protocol.PacketNumberLen
-	switch typeByte & 0x7 {
-	case 0x0:
-		pnLen = protocol.PacketNumberLen1
-	case 0x1:
-		pnLen = protocol.PacketNumberLen2
-	case 0x2:
-		pnLen = protocol.PacketNumberLen4
-	default:
-		return nil, errors.New("invalid short header type")
-	}
-	pn, err := utils.BigEndian.ReadUintN(b, uint8(pnLen))
+	pn, pnLen, err := utils.ReadVarIntPacketNumber(b)
 	if err != nil {
 		return nil, err
 	}
 	return &Header{
-		KeyPhase:         int(typeByte&0x20) >> 5,
-		OmitConnectionID: omitConnID,
-		ConnectionID:     protocol.ConnectionID(connID),
-		PacketNumber:     protocol.PacketNumber(pn),
+		KeyPhase:         int(typeByte&0x40) >> 6,
+		DestConnectionID: connID,
+		PacketNumber:     pn,
 		PacketNumberLen:  pnLen,
 	}, nil
 }
@@ -119,54 +120,37 @@ func (h *Header) writeHeader(b *bytes.Buffer) error {
 
 // TODO: add support for the key phase
 func (h *Header) writeLongHeader(b *bytes.Buffer) error {
+	if h.SrcConnectionID.Len() != protocol.ConnectionIDLen {
+		return fmt.Errorf("Header: source connection ID must be %d bytes, is %d", protocol.ConnectionIDLen, h.SrcConnectionID.Len())
+	}
 	b.WriteByte(byte(0x80 | h.Type))
-	utils.BigEndian.WriteUint64(b, uint64(h.ConnectionID))
 	utils.BigEndian.WriteUint32(b, uint32(h.Version))
-	utils.BigEndian.WriteUint32(b, uint32(h.PacketNumber))
-	return nil
+	connIDLen, err := encodeConnIDLen(h.DestConnectionID, h.SrcConnectionID)
+	if err != nil {
+		return err
+	}
+	b.WriteByte(connIDLen)
+	b.Write(h.DestConnectionID.Bytes())
+	b.Write(h.SrcConnectionID.Bytes())
+	utils.WriteVarInt(b, uint64(h.PayloadLen))
+	return utils.WriteVarIntPacketNumber(b, h.PacketNumber, h.PacketNumberLen)
 }
 
 func (h *Header) writeShortHeader(b *bytes.Buffer) error {
-	typeByte := byte(0x10)
-	typeByte ^= byte(h.KeyPhase << 5)
-	if h.OmitConnectionID {
-		typeByte ^= 0x40
-	}
-	switch h.PacketNumberLen {
-	case protocol.PacketNumberLen1:
-	case protocol.PacketNumberLen2:
-		typeByte ^= 0x1
-	case protocol.PacketNumberLen4:
-		typeByte ^= 0x2
-	default:
-		return fmt.Errorf("invalid packet number length: %d", h.PacketNumberLen)
-	}
+	typeByte := byte(0x30)
+	typeByte |= byte(h.KeyPhase << 6)
 	b.WriteByte(typeByte)
 
-	if !h.OmitConnectionID {
-		utils.BigEndian.WriteUint64(b, uint64(h.ConnectionID))
-	}
-	switch h.PacketNumberLen {
-	case protocol.PacketNumberLen1:
-		b.WriteByte(uint8(h.PacketNumber))
-	case protocol.PacketNumberLen2:
-		utils.BigEndian.WriteUint16(b, uint16(h.PacketNumber))
-	case protocol.PacketNumberLen4:
-		utils.BigEndian.WriteUint32(b, uint32(h.PacketNumber))
-	}
-	return nil
+	b.Write(h.DestConnectionID.Bytes())
+	return utils.WriteVarIntPacketNumber(b, h.PacketNumber, h.PacketNumberLen)
 }
 
-// getHeaderLength gets the length of the Header in bytes.
 func (h *Header) getHeaderLength() (protocol.ByteCount, error) {
 	if h.IsLongHeader {
-		return 1 + 8 + 4 + 4, nil
+		return 1 /* type byte */ + 4 /* version */ + 1 /* conn id len byte */ + protocol.ByteCount(h.DestConnectionID.Len()+h.SrcConnectionID.Len()) + utils.VarIntLen(uint64(h.PayloadLen)) + protocol.ByteCount(h.PacketNumberLen), nil
 	}
 
-	length := protocol.ByteCount(1) // type byte
-	if !h.OmitConnectionID {
-		length += 8
-	}
+	length := protocol.ByteCount(1 /* type byte */ + h.DestConnectionID.Len())
 	if h.PacketNumberLen != protocol.PacketNumberLen1 && h.PacketNumberLen != protocol.PacketNumberLen2 && h.PacketNumberLen != protocol.PacketNumberLen4 {
 		return 0, fmt.Errorf("invalid packet number length: %d", h.PacketNumberLen)
 	}
@@ -176,12 +160,46 @@ func (h *Header) getHeaderLength() (protocol.ByteCount, error) {
 
 func (h *Header) logHeader(logger utils.Logger) {
 	if h.IsLongHeader {
-		logger.Debugf("   Long Header{Type: %s, ConnectionID: %#x, PacketNumber: %#x, Version: %s}", h.Type, h.ConnectionID, h.PacketNumber, h.Version)
-	} else {
-		connID := "(omitted)"
-		if !h.OmitConnectionID {
-			connID = fmt.Sprintf("%#x", h.ConnectionID)
+		if h.Version == 0 {
+			logger.Debugf("\tVersionNegotiationPacket{DestConnectionID: %s, SrcConnectionID: %s, SupportedVersions: %s}", h.DestConnectionID, h.SrcConnectionID, h.SupportedVersions)
+		} else {
+			logger.Debugf("\tLong Header{Type: %s, DestConnectionID: %s, SrcConnectionID: %s, PacketNumber: %#x, PacketNumberLen: %d, PayloadLen: %d, Version: %s}", h.Type, h.DestConnectionID, h.SrcConnectionID, h.PacketNumber, h.PacketNumberLen, h.PayloadLen, h.Version)
 		}
-		logger.Debugf("   Short Header{ConnectionID: %s, PacketNumber: %#x, PacketNumberLen: %d, KeyPhase: %d}", connID, h.PacketNumber, h.PacketNumberLen, h.KeyPhase)
+	} else {
+		logger.Debugf("\tShort Header{DestConnectionID: %s, PacketNumber: %#x, PacketNumberLen: %d, KeyPhase: %d}", h.DestConnectionID, h.PacketNumber, h.PacketNumberLen, h.KeyPhase)
 	}
+}
+
+func encodeConnIDLen(dest, src protocol.ConnectionID) (byte, error) {
+	dcil, err := encodeSingleConnIDLen(dest)
+	if err != nil {
+		return 0, err
+	}
+	scil, err := encodeSingleConnIDLen(src)
+	if err != nil {
+		return 0, err
+	}
+	return scil | dcil<<4, nil
+}
+
+func encodeSingleConnIDLen(id protocol.ConnectionID) (byte, error) {
+	len := id.Len()
+	if len == 0 {
+		return 0, nil
+	}
+	if len < 4 || len > 18 {
+		return 0, fmt.Errorf("invalid connection ID length: %d bytes", len)
+	}
+	return byte(len - 3), nil
+}
+
+func decodeConnIDLen(enc byte) (int /*dest conn id len*/, int /*src conn id len*/) {
+	return decodeSingleConnIDLen(enc >> 4), decodeSingleConnIDLen(enc & 0xf)
+}
+
+func decodeSingleConnIDLen(enc uint8) int {
+	if enc == 0 {
+		return 0
+	}
+	return int(enc) + 3
 }

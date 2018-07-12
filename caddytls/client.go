@@ -27,7 +27,7 @@ import (
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/telemetry"
-	"github.com/xenolf/lego/acmev2"
+	"github.com/xenolf/lego/acme"
 )
 
 // acmeMu ensures that only one ACME challenge occurs at a time.
@@ -312,7 +312,7 @@ func (c *ACMEClient) Renew(name string) error {
 	certMeta.PrivateKey = siteData.Key
 
 	// Perform renewal and retry if necessary, but not too many times.
-	var newCertMeta acme.CertificateResource
+	var newCertMeta *acme.CertificateResource
 	var success bool
 	for attempts := 0; attempts < 2; attempts++ {
 		namesObtaining.Add([]string{name})

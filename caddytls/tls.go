@@ -39,7 +39,7 @@ import (
 	"strings"
 
 	"github.com/mholt/caddy"
-	"github.com/xenolf/lego/acmev2"
+	"github.com/xenolf/lego/acme"
 )
 
 // HostQualifies returns true if the hostname alone
@@ -72,7 +72,7 @@ func HostQualifies(hostname string) bool {
 // saveCertResource saves the certificate resource to disk. This
 // includes the certificate file itself, the private key, and the
 // metadata file.
-func saveCertResource(storage Storage, cert acme.CertificateResource) error {
+func saveCertResource(storage Storage, cert *acme.CertificateResource) error {
 	// Save cert, private key, and metadata
 	siteData := &SiteData{
 		Cert: cert.Certificate,
